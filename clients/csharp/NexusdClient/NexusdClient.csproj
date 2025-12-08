@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>NexusdClient</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>NexusD Contributors</Authors>
+    <Description>C# client library for NexusD pub/sub sidecar daemon</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/nexusd/nexusd</RepositoryUrl>
+    <PackageTags>pubsub;grpc;nexusd;messaging</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.25.1" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.60.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.60.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="..\..\proto\sidecar.proto" GrpcServices="Client" ProtoRoot="..\..\proto" />
+  </ItemGroup>
+
+</Project>

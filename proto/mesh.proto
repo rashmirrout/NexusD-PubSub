@@ -1,0 +1,103 @@
+// =============================================================================
+// NexusD - Inter-Node Mesh Protocol Buffer Definitions
+// =============================================================================
+//
+// Defines the MeshService for daemon-to-daemon communication.
+// Used for state synchronization and message forwarding between nodes.
+//
+// Copyright (c) 2024 NexusD Contributors
+// License: MIT
+// =============================================================================
+
+syntax = "proto3";
+
+package nexusd.mesh;
+
+option cc_enable_arenas = true;
+
+import "google/protobuf/empty.proto";
+
+// =============================================================================
+// MeshService - Inter-node RPC service
+// =============================================================================
+// This service runs on the mesh_port and handles communication between daemons.
+
+service MeshService {
+    // GetNodeState is called when a peer detects a topic_state_hash mismatch.
+    // Returns the full list of topics this node is subscribed to.
+    rpc GetNodeState(google.protobuf.Empty) returns (NodeState);
+
+    // PushMessage forwards a published message to a remote node.
+    // Called when a local publisher has remote subscribers.
+    rpc PushMessage(MessageEnvelope) returns (Ack);
+
+    // PushMessageStream is a bidirectional streaming variant for high-throughput.
+    // Messages flow in both directions between connected peers.
+    rpc PushMessageStream(stream MessageEnvelope) returns (stream Ack);
+}
+
+// =============================================================================
+// Messages
+// =============================================================================
+
+// NodeState contains the complete subscription state of a node.
+// Returned by GetNodeState during anti-entropy synchronization.
+message NodeState {
+    // The instance UUID of the responding node (for verification).
+    string instance_uuid = 1;
+
+    // List of topics this node has local subscribers for.
+    repeated string topics = 2;
+
+    // Current hash of the topic list (should match beacon's topic_state_hash).
+    uint64 topic_state_hash = 3;
+
+    // Retained messages this node is holding (for late-joiner support).
+    // Key: topic name, Value: the retained message envelope.
+    map<string, MessageEnvelope> retained_messages = 4;
+}
+
+// MessageEnvelope wraps a published message for network transmission.
+message MessageEnvelope {
+    // Unique message ID (UUID) for deduplication and tracing.
+    string message_id = 1;
+
+    // The topic this message was published to.
+    string topic = 2;
+
+    // The raw payload bytes. Interpretation is application-defined.
+    // NexusD treats this as an opaque blob.
+    bytes payload = 3;
+
+    // Content type hint (e.g., "application/json", "application/protobuf").
+    // Optional - helps clients deserialize without out-of-band knowledge.
+    string content_type = 4;
+
+    // Timestamp when the message was originally published (ms since epoch).
+    int64 timestamp_ms = 5;
+
+    // Instance UUID of the originating publisher's daemon.
+    string source_node_id = 6;
+
+    // If true, this message should be retained for late subscribers.
+    bool retain = 7;
+
+    // Optional correlation ID for request-response patterns.
+    string correlation_id = 8;
+
+    // Time-to-live in milliseconds. 0 means no expiration.
+    // Messages older than TTL may be dropped by receivers.
+    int64 ttl_ms = 9;
+}
+
+// Ack is a simple acknowledgment response.
+message Ack {
+    // True if the operation succeeded.
+    bool success = 1;
+
+    // Optional error message if success is false.
+    string error_message = 2;
+
+    // The message_id being acknowledged (for correlation).
+    string message_id = 3;
+}

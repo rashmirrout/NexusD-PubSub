@@ -1,0 +1,49 @@
+// =============================================================================
+// NexusD - Discovery Protocol Buffer Definitions
+// =============================================================================
+//
+// Defines the Beacon message used for UDP multicast discovery.
+// This is NOT a gRPC service - it's serialized and sent over raw UDP.
+//
+// Copyright (c) 2024 NexusD Contributors
+// License: MIT
+// =============================================================================
+
+syntax = "proto3";
+
+package nexusd.discovery;
+
+option cc_enable_arenas = true;
+
+// Beacon is broadcast via UDP multicast at 1Hz for peer discovery.
+// Each daemon broadcasts its presence and a hash of its subscription state.
+message Beacon {
+    // Random session ID, regenerated on every daemon restart.
+    // Format: UUID v4 string (e.g., "550e8400-e29b-41d4-a716-446655440000")
+    string instance_uuid = 1;
+
+    // Cluster partition key. Nodes with different cluster_id values
+    // MUST ignore each other's beacons. Allows overlapping meshes on same LAN.
+    // Examples: "prod", "staging", "robot_fleet_a", "simulation"
+    string cluster_id = 2;
+
+    // IP address where this node's inter-mesh gRPC service is listening.
+    // Should be a routable address (not 127.0.0.1 unless single-machine testing).
+    string rpc_ip = 3;
+
+    // TCP port for the inter-mesh gRPC service (MeshService).
+    int32 rpc_port = 4;
+
+    // CRC64 hash of this node's current subscription list.
+    // When a peer detects a hash mismatch, it initiates a GetNodeState sync.
+    // Computed over sorted, concatenated topic names.
+    uint64 topic_state_hash = 5;
+
+    // Timestamp when this beacon was generated (milliseconds since epoch).
+    // Used for distributed time sanity checks (not strict synchronization).
+    int64 timestamp_ms = 6;
+
+    // Protocol version for forward compatibility.
+    // Current version: 1
+    int32 protocol_version = 7;
+}

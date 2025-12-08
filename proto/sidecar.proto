@@ -1,0 +1,225 @@
+// =============================================================================
+// NexusD - Sidecar Protocol Buffer Definitions
+// =============================================================================
+//
+// Defines the SidecarService for local application communication.
+// This is the API that thin clients (Python, C++, Rust, etc.) use.
+//
+// Copyright (c) 2024 NexusD Contributors
+// License: MIT
+// =============================================================================
+
+syntax = "proto3";
+
+package nexusd.sidecar;
+
+option cc_enable_arenas = true;
+
+// =============================================================================
+// SidecarService - Local application RPC service
+// =============================================================================
+// This service runs on app_port (default 50051) and binds to 127.0.0.1.
+// It handles all pub/sub operations for local applications.
+
+service SidecarService {
+    // Publish sends a message to a topic.
+    // The daemon routes it to all subscribers (local and remote).
+    rpc Publish(PublishRequest) returns (PublishResponse);
+
+    // Subscribe opens a server-streaming RPC.
+    // The client receives messages for the requested topics until cancelled.
+    rpc Subscribe(SubscribeRequest) returns (stream MessageEvent);
+
+    // Unsubscribe removes a subscription.
+    // The subscription_id is returned by Subscribe in the first MessageEvent.
+    rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+
+    // GetTopics returns the list of topics with active subscribers.
+    // Useful for debugging and monitoring.
+    rpc GetTopics(GetTopicsRequest) returns (GetTopicsResponse);
+
+    // GetPeers returns information about discovered mesh peers.
+    // Useful for debugging and monitoring.
+    rpc GetPeers(GetPeersRequest) returns (GetPeersResponse);
+}
+
+// =============================================================================
+// Publish Messages
+// =============================================================================
+
+message PublishRequest {
+    // The topic to publish to.
+    string topic = 1;
+
+    // The message payload (opaque bytes).
+    bytes payload = 2;
+
+    // Content type hint (e.g., "application/json").
+    string content_type = 3;
+
+    // If true, the message is retained for late subscribers.
+    bool retain = 4;
+
+    // Optional correlation ID for request-response patterns.
+    string correlation_id = 5;
+
+    // Time-to-live in milliseconds. 0 = no expiration.
+    int64 ttl_ms = 6;
+}
+
+message PublishResponse {
+    // True if the message was accepted for routing.
+    bool success = 1;
+
+    // Unique message ID assigned by the daemon.
+    string message_id = 2;
+
+    // Number of subscribers the message was routed to.
+    // Includes both local and remote subscribers.
+    int32 subscriber_count = 3;
+
+    // Error message if success is false.
+    string error_message = 4;
+}
+
+// =============================================================================
+// Subscribe Messages
+// =============================================================================
+
+message SubscribeRequest {
+    // List of topic patterns to subscribe to.
+    // Exact match only in v1.0 (wildcard support planned for v2.0).
+    repeated string topics = 1;
+
+    // Client-provided identifier for this subscription (for logging).
+    string client_id = 2;
+
+    // If true, request retained messages for subscribed topics.
+    bool receive_retained = 3;
+
+    // Maximum messages to buffer before dropping (0 = unlimited).
+    // Helps slow consumers avoid unbounded memory growth.
+    int32 max_buffer_size = 4;
+}
+
+// MessageEvent is streamed to subscribers.
+// The first event contains metadata; subsequent events are messages.
+message MessageEvent {
+    oneof event {
+        // First message after Subscribe - contains subscription metadata.
+        SubscriptionInfo subscription_info = 1;
+
+        // A published message matching the subscription.
+        Message message = 2;
+
+        // Indicates a retained message is being delivered.
+        Message retained_message = 3;
+
+        // Heartbeat to keep connection alive (sent every 30s if idle).
+        Heartbeat heartbeat = 4;
+    }
+}
+
+message SubscriptionInfo {
+    // Unique subscription ID assigned by the daemon.
+    // Use this for Unsubscribe.
+    string subscription_id = 1;
+
+    // List of topics actually subscribed to.
+    repeated string topics = 2;
+
+    // Timestamp when subscription was established.
+    int64 timestamp_ms = 3;
+}
+
+message Message {
+    // Unique message ID.
+    string message_id = 1;
+
+    // The topic this message was published to.
+    string topic = 2;
+
+    // The message payload.
+    bytes payload = 3;
+
+    // Content type hint.
+    string content_type = 4;
+
+    // When the message was originally published.
+    int64 timestamp_ms = 5;
+
+    // The source node that first published this message.
+    string source_node_id = 6;
+
+    // Correlation ID if set by publisher.
+    string correlation_id = 7;
+}
+
+message Heartbeat {
+    // Current server timestamp.
+    int64 timestamp_ms = 1;
+}
+
+// =============================================================================
+// Unsubscribe Messages
+// =============================================================================
+
+message UnsubscribeRequest {
+    // The subscription ID to cancel.
+    string subscription_id = 1;
+}
+
+message UnsubscribeResponse {
+    // True if the subscription was found and cancelled.
+    bool success = 1;
+
+    // Error message if success is false.
+    string error_message = 2;
+}
+
+// =============================================================================
+// Monitoring Messages
+// =============================================================================
+
+message GetTopicsRequest {
+    // If true, include subscriber counts.
+    bool include_counts = 1;
+}
+
+message GetTopicsResponse {
+    // Map of topic name to subscriber count.
+    map<string, int32> topics = 1;
+}
+
+message GetPeersRequest {
+    // If true, include full peer state (topics, etc.).
+    bool include_state = 1;
+}
+
+message GetPeersResponse {
+    // List of discovered peers.
+    repeated PeerInfo peers = 1;
+}
+
+message PeerInfo {
+    // The peer's instance UUID.
+    string instance_uuid = 1;
+
+    // The peer's gRPC endpoint (ip:port).
+    string endpoint = 2;
+
+    // When we last received a beacon from this peer.
+    int64 last_seen_ms = 3;
+
+    // The peer's cluster ID (should match ours).
+    string cluster_id = 4;
+
+    // The peer's topic state hash.
+    uint64 topic_state_hash = 5;
+
+    // If include_state was true, the peer's subscribed topics.
+    repeated string topics = 6;
+
+    // Peer status: "alive", "suspected", "dead"
+    string status = 7;
+}
