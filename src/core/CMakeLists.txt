@@ -17,12 +17,14 @@ set(LIB_NAME nexusd_core)
 set(CORE_SOURCES
     peer_registry.cpp
     discovery_agent.cpp
+    topic_message_buffer.cpp
 )
 
 set(CORE_HEADERS
     ${CMAKE_SOURCE_DIR}/include/nexusd/core/export.hpp
     ${CMAKE_SOURCE_DIR}/include/nexusd/core/peer_registry.hpp
     ${CMAKE_SOURCE_DIR}/include/nexusd/core/discovery_agent.hpp
+    ${CMAKE_SOURCE_DIR}/include/nexusd/core/topic_message_buffer.hpp
 )
 
 # ----------------------------------------------------------------------------

@@ -108,8 +108,29 @@ struct NEXUSD_CORE_API LocalSubscription {
     int32_t max_buffer_size;
     std::chrono::steady_clock::time_point created_at;
     
+    // Gap recovery state
+    uint64_t last_delivered_sequence = 0;  ///< Last sequence number delivered to client
+    
     // Callback to deliver messages (set by SidecarService)
     std::function<void(const RetainedMessage&)> deliverCallback;
+};
+
+/**
+ * @struct PausedSubscription
+ * @brief A subscription that was paused for later resumption.
+ * 
+ * When a client disconnects with pause=true, we store the subscription
+ * state here so the client can resume with ResumeSubscribe.
+ */
+struct NEXUSD_CORE_API PausedSubscription {
+    std::string subscription_id;
+    std::string client_id;
+    std::vector<std::string> topics;
+    int32_t max_buffer_size;
+    uint64_t last_delivered_sequence;  ///< Per-topic last sequence (for primary topic)
+    std::unordered_map<std::string, uint64_t> topic_sequences;  ///< Per-topic sequences
+    std::chrono::steady_clock::time_point paused_at;
+    std::chrono::steady_clock::time_point expires_at;
 };
 
 /**
@@ -219,9 +240,57 @@ public:
     /**
      * @brief Remove a local subscription.
      * @param subscriptionId The subscription to remove.
+     * @param pause If true, save state for later resumption.
+     * @param ttl_ms Time-to-live for paused subscription.
      * @return True if found and removed.
      */
-    bool removeLocalSubscription(const std::string& subscriptionId);
+    bool removeLocalSubscription(const std::string& subscriptionId,
+                                 bool pause = false,
+                                 int64_t ttl_ms = 300000);
+
+    /**
+     * @brief Pause a subscription for later resumption.
+     * @param subscriptionId The subscription to pause.
+     * @param ttl_ms Time-to-live for the paused state.
+     * @return True if successfully paused.
+     */
+    bool pauseSubscription(const std::string& subscriptionId, int64_t ttl_ms);
+
+    /**
+     * @brief Resume a paused subscription.
+     * @param subscriptionId The subscription to resume.
+     * @param callback New delivery callback.
+     * @param out_paused_info Output: the paused subscription info (for gap detection).
+     * @return True if found and resumed.
+     */
+    bool resumeSubscription(
+        const std::string& subscriptionId,
+        std::function<void(const RetainedMessage&)> callback,
+        PausedSubscription& out_paused_info);
+
+    /**
+     * @brief Get a paused subscription without resuming.
+     * @param subscriptionId The subscription ID.
+     * @return The paused subscription info, or nullptr.
+     */
+    std::shared_ptr<PausedSubscription> getPausedSubscription(
+        const std::string& subscriptionId) const;
+
+    /**
+     * @brief Clear expired paused subscriptions.
+     * @return Number of subscriptions cleared.
+     */
+    size_t clearExpiredPausedSubscriptions();
+
+    /**
+     * @brief Update the last delivered sequence for a subscription.
+     * @param subscriptionId The subscription ID.
+     * @param topic The topic.
+     * @param sequence The sequence number.
+     */
+    void updateSubscriptionSequence(const std::string& subscriptionId,
+                                    const std::string& topic,
+                                    uint64_t sequence);
 
     /**
      * @brief Get local subscriptions for a topic.
@@ -315,6 +384,9 @@ private:
     
     // Topic -> subscription IDs (for fast lookup)
     std::unordered_map<std::string, std::unordered_set<std::string>> topicToSubscriptions_;
+    
+    // Paused subscriptions: subscription_id -> PausedSubscription
+    std::unordered_map<std::string, std::shared_ptr<PausedSubscription>> pausedSubscriptions_;
     
     // Cached local topic hash
     mutable std::atomic<uint64_t> cachedLocalHash_{0};

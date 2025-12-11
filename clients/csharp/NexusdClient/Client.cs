@@ -1,9 +1,33 @@
 using System.Runtime.CompilerServices;
 using System.Text;
 using Grpc.Net.Client;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Nexusd.Sidecar;
 
 namespace NexusdClient;
+
+/// <summary>
+/// Gap recovery mode for ResumeSubscribe.
+/// </summary>
+public enum GapRecoveryMode
+{
+    None = 0,
+    RetainedOnly = 1,
+    ReplayBuffer = 2
+}
+
+/// <summary>
+/// Configuration for automatic reconnection.
+/// </summary>
+public class ReconnectConfig
+{
+    public bool Enabled { get; set; } = true;
+    public TimeSpan InitialDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan MaxDelay { get; set; } = TimeSpan.FromSeconds(30);
+    public double Multiplier { get; set; } = 2.0;
+    public int MaxAttempts { get; set; } = 0; // 0 = unlimited
+}
 
 /// <summary>
 /// A received message from a subscription.
@@ -16,7 +40,9 @@ public record Message(
     long TimestampMs,
     string SourceNodeId,
     string CorrelationId,
-    bool IsRetained
+    bool IsRetained,
+    bool IsReplay = false,
+    ulong SequenceNumber = 0
 )
 {
     /// <summary>
@@ -24,6 +50,18 @@ public record Message(
     /// </summary>
     public string PayloadAsString => Encoding.UTF8.GetString(Payload);
 }
+
+/// <summary>
+/// Information about an active subscription.
+/// </summary>
+public record SubscriptionInfo(
+    string SubscriptionId,
+    IReadOnlyList<string> Topics,
+    bool GapDetected,
+    ulong MissedMessageCount,
+    bool ReplayStarted,
+    ulong LastSequence
+);
 
 /// <summary>
 /// Result of a publish operation.
@@ -43,6 +81,7 @@ public class SubscribeOptions
     public string ClientId { get; set; } = "";
     public bool ReceiveRetained { get; set; } = true;
     public int MaxBufferSize { get; set; } = 0;
+    public GapRecoveryMode GapRecoveryMode { get; set; } = GapRecoveryMode.ReplayBuffer;
 }
 
 /// <summary>
@@ -66,6 +105,8 @@ public record PeerInfo(
 
 /// <summary>
 /// NexusD Client for the pub/sub sidecar daemon.
+/// Features automatic reconnection with exponential backoff,
+/// gap detection, and message replay.
 /// </summary>
 /// <example>
 /// <code>
@@ -80,20 +121,75 @@ public record PeerInfo(
 /// </example>
 public class Client : IDisposable
 {
-    private readonly GrpcChannel _channel;
-    private readonly SidecarService.SidecarServiceClient _client;
+    private readonly string _address;
+    private GrpcChannel _channel;
+    private SidecarService.SidecarServiceClient _client;
     private readonly string _clientId;
+    private readonly ReconnectConfig _reconnectConfig;
+    private readonly ILogger<Client> _logger;
+    private readonly Dictionary<string, SubscriptionInfo> _activeSubscriptions = new();
+    private readonly object _subscriptionLock = new();
 
     /// <summary>
     /// Create a new NexusD client.
     /// </summary>
     /// <param name="address">Daemon address in "host:port" format</param>
-    public Client(string address = "localhost:5672")
+    /// <param name="reconnectConfig">Reconnection configuration</param>
+    /// <param name="logger">Optional logger</param>
+    public Client(
+        string address = "localhost:5672",
+        ReconnectConfig? reconnectConfig = null,
+        ILogger<Client>? logger = null)
     {
-        var uri = address.StartsWith("http") ? address : $"http://{address}";
-        _channel = GrpcChannel.ForAddress(uri);
+        _address = address.StartsWith("http") ? address : $"http://{address}";
+        _channel = GrpcChannel.ForAddress(_address);
         _client = new SidecarService.SidecarServiceClient(_channel);
         _clientId = Guid.NewGuid().ToString();
+        _reconnectConfig = reconnectConfig ?? new ReconnectConfig();
+        _logger = logger ?? NullLogger<Client>.Instance;
+        
+        _logger.LogInformation("NexusD client initialized for {Address}", address);
+    }
+
+    private async Task ReconnectAsync(CancellationToken ct)
+    {
+        if (!_reconnectConfig.Enabled)
+            throw new InvalidOperationException("Reconnection is disabled");
+
+        var delay = _reconnectConfig.InitialDelay;
+        var attempt = 0;
+
+        while (true)
+        {
+            attempt++;
+            if (_reconnectConfig.MaxAttempts > 0 && attempt > _reconnectConfig.MaxAttempts)
+            {
+                _logger.LogError("Max reconnection attempts {MaxAttempts} exceeded", _reconnectConfig.MaxAttempts);
+                throw new InvalidOperationException("Max reconnection attempts exceeded");
+            }
+
+            _logger.LogInformation("Reconnection attempt {Attempt} with delay {Delay}ms", 
+                attempt, delay.TotalMilliseconds);
+
+            await Task.Delay(delay, ct);
+
+            try
+            {
+                _channel.Dispose();
+                _channel = GrpcChannel.ForAddress(_address);
+                _client = new SidecarService.SidecarServiceClient(_channel);
+                _logger.LogInformation("Reconnection successful on attempt {Attempt}", attempt);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Reconnection attempt {Attempt} failed", attempt);
+            }
+
+            delay = TimeSpan.FromMilliseconds(Math.Min(
+                delay.TotalMilliseconds * _reconnectConfig.Multiplier,
+                _reconnectConfig.MaxDelay.TotalMilliseconds));
+        }
     }
 
     /// <summary>
@@ -118,14 +214,30 @@ public class Client : IDisposable
             TtlMs = ttlMs
         };
 
-        var response = await _client.PublishAsync(request, cancellationToken: ct);
+        try
+        {
+            var response = await _client.PublishAsync(request, cancellationToken: ct);
+            _logger.LogDebug("Published to {Topic}, message_id={MessageId}", topic, response.MessageId);
 
-        return new PublishResult(
-            response.Success,
-            response.MessageId,
-            response.SubscriberCount,
-            response.ErrorMessage
-        );
+            return new PublishResult(
+                response.Success,
+                response.MessageId,
+                response.SubscriberCount,
+                response.ErrorMessage
+            );
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unavailable)
+        {
+            _logger.LogWarning("Connection lost during publish, reconnecting...");
+            await ReconnectAsync(ct);
+            var response = await _client.PublishAsync(request, cancellationToken: ct);
+            return new PublishResult(
+                response.Success,
+                response.MessageId,
+                response.SubscriberCount,
+                response.ErrorMessage
+            );
+        }
     }
 
     /// <summary>
@@ -153,55 +265,158 @@ public class Client : IDisposable
 
     /// <summary>
     /// Subscribe to topics and receive messages as an async stream.
+    /// Features automatic reconnection with gap detection.
     /// </summary>
+    /// <param name="topics">Topics to subscribe to</param>
+    /// <param name="options">Subscribe options</param>
+    /// <param name="onGapDetected">Callback when gap is detected</param>
+    /// <param name="ct">Cancellation token</param>
     public async IAsyncEnumerable<Message> SubscribeAsync(
         IEnumerable<string> topics,
         SubscribeOptions? options = null,
+        Action<SubscriptionInfo>? onGapDetected = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         options ??= new SubscribeOptions();
+        var topicList = topics.ToList();
+        string? subscriptionId = null;
+        ulong lastSequence = 0;
 
-        var request = new SubscribeRequest
+        while (!ct.IsCancellationRequested)
         {
-            ClientId = string.IsNullOrEmpty(options.ClientId) ? _clientId : options.ClientId,
-            ReceiveRetained = options.ReceiveRetained,
-            MaxBufferSize = options.MaxBufferSize
-        };
-        request.Topics.AddRange(topics);
+            Grpc.Core.AsyncServerStreamingCall<MessageEvent>? call = null;
+            
+            try
+            {
+                if (subscriptionId != null && _reconnectConfig.Enabled)
+                {
+                    // Resume with gap recovery
+                    _logger.LogInformation("Resuming subscription {SubscriptionId} from sequence {Sequence}",
+                        subscriptionId, lastSequence);
 
-        using var call = _client.Subscribe(request, cancellationToken: ct);
+                    var resumeRequest = new ResumeSubscribeRequest
+                    {
+                        SubscriptionId = subscriptionId,
+                        LastSequenceNumber = lastSequence,
+                        GapRecoveryMode = (Nexusd.Sidecar.GapRecoveryMode)options.GapRecoveryMode
+                    };
+                    call = _client.ResumeSubscribe(resumeRequest, cancellationToken: ct);
+                }
+                else
+                {
+                    // Fresh subscription
+                    var request = new SubscribeRequest
+                    {
+                        ClientId = string.IsNullOrEmpty(options.ClientId) ? _clientId : options.ClientId,
+                        ReceiveRetained = options.ReceiveRetained,
+                        MaxBufferSize = options.MaxBufferSize
+                    };
+                    request.Topics.AddRange(topicList);
+                    call = _client.Subscribe(request, cancellationToken: ct);
+                }
 
-        await foreach (var eventMsg in call.ResponseStream.ReadAllAsync(ct))
+                await foreach (var eventMsg in call.ResponseStream.ReadAllAsync(ct))
+                {
+                    switch (eventMsg.EventCase)
+                    {
+                        case MessageEvent.EventOneofCase.SubscriptionInfo:
+                            subscriptionId = eventMsg.SubscriptionInfo.SubscriptionId;
+                            var subInfo = new SubscriptionInfo(
+                                eventMsg.SubscriptionInfo.SubscriptionId,
+                                eventMsg.SubscriptionInfo.Topics.ToList(),
+                                eventMsg.SubscriptionInfo.GapDetected,
+                                eventMsg.SubscriptionInfo.MissedMessageCount,
+                                eventMsg.SubscriptionInfo.ReplayStarted,
+                                lastSequence
+                            );
+
+                            lock (_subscriptionLock)
+                            {
+                                _activeSubscriptions[subscriptionId] = subInfo;
+                            }
+
+                            _logger.LogInformation("Subscription {Id} active, gap={Gap}, missed={Missed}",
+                                subscriptionId, subInfo.GapDetected, subInfo.MissedMessageCount);
+
+                            if (subInfo.GapDetected && onGapDetected != null)
+                            {
+                                onGapDetected(subInfo);
+                            }
+                            break;
+
+                        case MessageEvent.EventOneofCase.Message:
+                            lastSequence = eventMsg.Message.SequenceNumber;
+                            yield return new Message(
+                                eventMsg.Message.MessageId,
+                                eventMsg.Message.Topic,
+                                eventMsg.Message.Payload.ToByteArray(),
+                                eventMsg.Message.ContentType,
+                                eventMsg.Message.TimestampMs,
+                                eventMsg.Message.SourceNodeId,
+                                eventMsg.Message.CorrelationId,
+                                IsRetained: false,
+                                IsReplay: false,
+                                SequenceNumber: eventMsg.Message.SequenceNumber
+                            );
+                            break;
+
+                        case MessageEvent.EventOneofCase.RetainedMessage:
+                            yield return new Message(
+                                eventMsg.RetainedMessage.MessageId,
+                                eventMsg.RetainedMessage.Topic,
+                                eventMsg.RetainedMessage.Payload.ToByteArray(),
+                                eventMsg.RetainedMessage.ContentType,
+                                eventMsg.RetainedMessage.TimestampMs,
+                                eventMsg.RetainedMessage.SourceNodeId,
+                                eventMsg.RetainedMessage.CorrelationId,
+                                IsRetained: true
+                            );
+                            break;
+
+                        case MessageEvent.EventOneofCase.ReplayMessage:
+                            lastSequence = Math.Max(lastSequence, eventMsg.ReplayMessage.SequenceNumber);
+                            yield return new Message(
+                                eventMsg.ReplayMessage.MessageId,
+                                eventMsg.ReplayMessage.Topic,
+                                eventMsg.ReplayMessage.Payload.ToByteArray(),
+                                "",
+                                eventMsg.ReplayMessage.TimestampMs,
+                                eventMsg.ReplayMessage.SourceNodeId,
+                                "",
+                                IsRetained: false,
+                                IsReplay: true,
+                                SequenceNumber: eventMsg.ReplayMessage.SequenceNumber
+                            );
+                            break;
+
+                        case MessageEvent.EventOneofCase.ReplayComplete:
+                            _logger.LogInformation("Replay complete for subscription {Id}", subscriptionId);
+                            break;
+                    }
+                }
+
+                // Stream ended normally
+                break;
+            }
+            catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Cancelled)
+            {
+                _logger.LogDebug("Subscription cancelled");
+                break;
+            }
+            catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unavailable)
+            {
+                _logger.LogWarning("Connection lost during subscription, reconnecting...");
+                await ReconnectAsync(ct);
+                // Loop will retry with ResumeSubscribe
+            }
+        }
+
+        // Cleanup
+        if (subscriptionId != null)
         {
-            Message? message = eventMsg.EventCase switch
+            lock (_subscriptionLock)
             {
-                MessageEvent.EventOneofCase.Message => new Message(
-                    eventMsg.Message.MessageId,
-                    eventMsg.Message.Topic,
-                    eventMsg.Message.Payload.ToByteArray(),
-                    eventMsg.Message.ContentType,
-                    eventMsg.Message.TimestampMs,
-                    eventMsg.Message.SourceNodeId,
-                    eventMsg.Message.CorrelationId,
-                    IsRetained: false
-                ),
-                MessageEvent.EventOneofCase.RetainedMessage => new Message(
-                    eventMsg.RetainedMessage.MessageId,
-                    eventMsg.RetainedMessage.Topic,
-                    eventMsg.RetainedMessage.Payload.ToByteArray(),
-                    eventMsg.RetainedMessage.ContentType,
-                    eventMsg.RetainedMessage.TimestampMs,
-                    eventMsg.RetainedMessage.SourceNodeId,
-                    eventMsg.RetainedMessage.CorrelationId,
-                    IsRetained: true
-                ),
-                // Ignore subscription_info and heartbeat
-                _ => null
-            };
-
-            if (message != null)
-            {
-                yield return message;
+                _activeSubscriptions.Remove(subscriptionId);
             }
         }
     }
@@ -209,10 +424,27 @@ public class Client : IDisposable
     /// <summary>
     /// Unsubscribe from a subscription.
     /// </summary>
-    public async Task<bool> UnsubscribeAsync(string subscriptionId, CancellationToken ct = default)
+    /// <param name="subscriptionId">Subscription ID to cancel</param>
+    /// <param name="pause">If true, pause for later resumption</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task<bool> UnsubscribeAsync(
+        string subscriptionId, 
+        bool pause = false,
+        CancellationToken ct = default)
     {
-        var request = new UnsubscribeRequest { SubscriptionId = subscriptionId };
+        var request = new UnsubscribeRequest 
+        { 
+            SubscriptionId = subscriptionId,
+            Pause = pause
+        };
         var response = await _client.UnsubscribeAsync(request, cancellationToken: ct);
+
+        lock (_subscriptionLock)
+        {
+            _activeSubscriptions.Remove(subscriptionId);
+        }
+
+        _logger.LogInformation("Unsubscribed {Id}, pause={Pause}", subscriptionId, pause);
         return response.Success;
     }
 
@@ -240,6 +472,17 @@ public class Client : IDisposable
         return response.Peers
             .Select(p => new PeerInfo(p.NodeId, p.Address, p.ClusterId, p.IsHealthy))
             .ToList();
+    }
+
+    /// <summary>
+    /// Get active subscriptions.
+    /// </summary>
+    public IReadOnlyList<SubscriptionInfo> GetActiveSubscriptions()
+    {
+        lock (_subscriptionLock)
+        {
+            return _activeSubscriptions.Values.ToList();
+        }
     }
 
     /// <summary>

@@ -30,8 +30,13 @@ service SidecarService {
     // The client receives messages for the requested topics until cancelled.
     rpc Subscribe(SubscribeRequest) returns (stream MessageEvent);
 
+    // ResumeSubscribe resumes a previously paused subscription.
+    // Supports gap recovery by replaying buffered messages since last sequence.
+    rpc ResumeSubscribe(ResumeSubscribeRequest) returns (stream MessageEvent);
+
     // Unsubscribe removes a subscription.
     // The subscription_id is returned by Subscribe in the first MessageEvent.
+    // Set pause=true to preserve state for later resume (e.g., during upgrades).
     rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
 
     // GetTopics returns the list of topics with active subscribers.
@@ -86,12 +91,26 @@ message PublishResponse {
 // Subscribe Messages
 // =============================================================================
 
+// Gap recovery mode for ResumeSubscribe.
+enum GapRecoveryMode {
+    // No gap recovery - just resume with live messages.
+    GAP_RECOVERY_NONE = 0;
+
+    // Only re-deliver retained messages for subscribed topics.
+    GAP_RECOVERY_RETAINED_ONLY = 1;
+
+    // Replay messages from server buffer since last sequence.
+    // Falls back to retained if buffer doesn't have enough history.
+    GAP_RECOVERY_REPLAY_BUFFER = 2;
+}
+
 message SubscribeRequest {
     // List of topic patterns to subscribe to.
     // Exact match only in v1.0 (wildcard support planned for v2.0).
     repeated string topics = 1;
 
     // Client-provided identifier for this subscription (for logging).
+    // Recommended format: "{hostname}-{pid}" (e.g., "myapp-host-12345").
     string client_id = 2;
 
     // If true, request retained messages for subscribed topics.
@@ -100,6 +119,28 @@ message SubscribeRequest {
     // Maximum messages to buffer before dropping (0 = unlimited).
     // Helps slow consumers avoid unbounded memory growth.
     int32 max_buffer_size = 4;
+}
+
+message ResumeSubscribeRequest {
+    // The subscription ID to resume (from previous SubscriptionInfo).
+    string subscription_id = 1;
+
+    // Topics to resume (must match original subscription).
+    repeated string topics = 2;
+
+    // Last message ID received by client (for gap detection).
+    string last_message_id = 3;
+
+    // Last sequence number received per topic.
+    // Key: topic name, Value: last sequence number.
+    // Used for precise gap recovery.
+    map<string, int64> last_sequence_per_topic = 4;
+
+    // How to handle gaps when messages were missed.
+    GapRecoveryMode gap_recovery_mode = 5;
+
+    // If true, also receive retained messages after replay.
+    bool receive_retained = 6;
 }
 
 // MessageEvent is streamed to subscribers.
@@ -117,12 +158,19 @@ message MessageEvent {
 
         // Heartbeat to keep connection alive (sent every 30s if idle).
         Heartbeat heartbeat = 4;
+
+        // A replayed message from buffer (during gap recovery).
+        Message replay_message = 5;
+
+        // Signals that replay phase is complete for a topic.
+        ReplayComplete replay_complete = 6;
     }
 }
 
 message SubscriptionInfo {
     // Unique subscription ID assigned by the daemon.
     // Use this for Unsubscribe.
+    // Format: sub-{cluster}-{client_id}-{topic_hash}-{random}
     string subscription_id = 1;
 
     // List of topics actually subscribed to.
@@ -130,6 +178,28 @@ message SubscriptionInfo {
 
     // Timestamp when subscription was established.
     int64 timestamp_ms = 3;
+
+    // True if this is a resumed subscription and gaps were detected.
+    bool gap_detected = 4;
+
+    // Number of messages that were missed (if gap_detected is true).
+    // -1 means unknown (buffer overflow, can't determine exact count).
+    int32 missed_message_count = 5;
+
+    // True if replay phase is starting (messages will be replay_message events).
+    bool replay_started = 6;
+}
+
+message ReplayComplete {
+    // The topic that replay completed for.
+    string topic = 1;
+
+    // Number of messages that were replayed.
+    int32 replayed_count = 2;
+
+    // The latest sequence number after replay.
+    // Client should track this for future reconnections.
+    int64 latest_sequence = 3;
 }
 
 message Message {
@@ -153,6 +223,12 @@ message Message {
 
     // Correlation ID if set by publisher.
     string correlation_id = 7;
+
+    // Monotonically increasing sequence number per topic.
+    // Used for ordering and gap detection.
+    // Note: Ordering is guaranteed within a topic only.
+    // Cross-topic ordering is NOT guaranteed.
+    int64 sequence_number = 8;
 }
 
 message Heartbeat {
@@ -167,14 +243,23 @@ message Heartbeat {
 message UnsubscribeRequest {
     // The subscription ID to cancel.
     string subscription_id = 1;
+
+    // If true, preserve subscription state for later resume.
+    // Use this during graceful shutdowns or software upgrades.
+    // The subscription can be resumed within pause_ttl.
+    bool pause = 2;
 }
 
 message UnsubscribeResponse {
-    // True if the subscription was found and cancelled.
+    // True if the subscription was found and cancelled/paused.
     bool success = 1;
 
     // Error message if success is false.
     string error_message = 2;
+
+    // If pause was true, how long the paused state will be kept (ms).
+    // After this time, the subscription must be recreated.
+    int64 pause_ttl_ms = 3;
 }
 
 // =============================================================================

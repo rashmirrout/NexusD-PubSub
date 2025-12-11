@@ -1,11 +1,12 @@
 //! NexusD Rust Client Library
 //!
 //! Async Rust client for the NexusD pub/sub sidecar daemon.
+//! Features automatic reconnection, gap detection, and message replay.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use nexusd_client::{NexusdClient, PublishOptions};
+//! use nexusd_client::{NexusdClient, PublishOptions, ReconnectConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,6 +34,11 @@ pub use client::{
     TopicInfo,
     PeerInfo,
     MessageStream,
+    // New types for resilience
+    SubscriptionInfo,
+    ReconnectConfig,
+    GapRecoveryMode,
+    GapCallback,
 };
 
 pub use error::Error;

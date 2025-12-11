@@ -25,6 +25,11 @@ struct Config {
     std::string bind_addr = "0.0.0.0";
     std::string log_level = "INFO";
     bool help = false;
+
+    // Message buffer settings for gap recovery
+    uint32_t message_buffer_size = 5;           ///< Messages per topic in ring buffer
+    size_t max_buffer_memory_bytes = 52428800;  ///< 50MB total memory limit for buffers
+    int64_t paused_subscription_ttl_ms = 300000; ///< 5 minutes TTL for paused subscriptions
 };
 
 /**
@@ -42,9 +47,13 @@ inline void printUsage(const char* program_name) {
               << "  --app-port <port>     gRPC port for application sidecar (default: 5672)\n"
               << "  --bind <addr>         Bind address for gRPC servers (default: 0.0.0.0)\n"
               << "  --log-level <level>   Log level: TRACE, DEBUG, INFO, WARN, ERROR, FATAL (default: INFO)\n"
+              << "  --message-buffer-size <n>    Messages per topic in ring buffer (default: 5)\n"
+              << "  --max-buffer-memory <bytes>  Total memory limit for buffers (default: 52428800 = 50MB)\n"
+              << "  --paused-subscription-ttl <ms> TTL for paused subscriptions (default: 300000 = 5min)\n"
               << "  --help                Show this help message\n\n"
               << "Example:\n"
-              << "  " << program_name << " --cluster production --mesh-port 5671 --app-port 5672\n";
+              << "  " << program_name << " --cluster production --mesh-port 5671 --app-port 5672\n"
+              << "  " << program_name << " --message-buffer-size 10 --max-buffer-memory 104857600\n";
 }
 
 /**
@@ -87,6 +96,12 @@ inline Config parseArgs(int argc, char* argv[]) {
             config.bind_addr = value;
         } else if (std::strcmp(arg, "--log-level") == 0) {
             config.log_level = value;
+        } else if (std::strcmp(arg, "--message-buffer-size") == 0) {
+            config.message_buffer_size = static_cast<uint32_t>(std::stoul(value));
+        } else if (std::strcmp(arg, "--max-buffer-memory") == 0) {
+            config.max_buffer_memory_bytes = std::stoull(value);
+        } else if (std::strcmp(arg, "--paused-subscription-ttl") == 0) {
+            config.paused_subscription_ttl_ms = std::stoll(value);
         } else {
             std::cerr << "Error: Unknown option " << arg << "\n";
             config.help = true;

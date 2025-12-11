@@ -13,6 +13,7 @@
 #include "nexusd/proto/mesh.pb.h"
 
 #include <chrono>
+#include <queue>
 
 namespace nexusd {
 namespace services {
@@ -149,11 +150,18 @@ private:
 
 SidecarServiceImpl::SidecarServiceImpl(
     std::shared_ptr<core::PeerRegistry> registry,
-    std::shared_ptr<MeshClient> meshClient)
+    std::shared_ptr<MeshClient> meshClient,
+    uint32_t messageBufferSize,
+    size_t maxBufferMemory,
+    int64_t pausedSubscriptionTtl)
     : registry_(std::move(registry))
     , meshClient_(std::move(meshClient))
+    , messageBuffer_(std::make_unique<core::TopicMessageBuffer>(
+          messageBufferSize, maxBufferMemory))
+    , pausedSubscriptionTtl_(pausedSubscriptionTtl)
 {
-    LOG_INFO("SidecarService", "Created sidecar service");
+    LOG_INFO("SidecarService", "Created sidecar service (buffer_size={}, max_memory={}, ttl={}ms)",
+             messageBufferSize, maxBufferMemory, pausedSubscriptionTtl);
 }
 
 SidecarServiceImpl::~SidecarServiceImpl() {
@@ -311,14 +319,16 @@ public:
     UnsubscribeReactor(SidecarServiceImpl* service,
                        std::shared_ptr<core::PeerRegistry> registry,
                        const sidecar::UnsubscribeRequest* request,
-                       sidecar::UnsubscribeResponse* response)
+                       sidecar::UnsubscribeResponse* response,
+                       int64_t defaultTtlMs)
     {
         const std::string& subId = request->subscription_id();
+        bool pause = request->pause();
         
-        LOG_INFO("SidecarService", "Unsubscribe: id={}", subId);
+        LOG_INFO("SidecarService", "Unsubscribe: id={} pause={}", subId, pause);
 
-        // Remove from registry
-        bool found = registry->removeLocalSubscription(subId);
+        // Remove from registry (with optional pause for later resumption)
+        bool found = registry->removeLocalSubscription(subId, pause, defaultTtlMs);
         
         // Cancel the stream
         {
@@ -349,7 +359,7 @@ grpc::ServerUnaryReactor* SidecarServiceImpl::Unsubscribe(
     const sidecar::UnsubscribeRequest* request,
     sidecar::UnsubscribeResponse* response) {
     
-    return new UnsubscribeReactor(this, registry_, request, response);
+    return new UnsubscribeReactor(this, registry_, request, response, pausedSubscriptionTtl_);
 }
 
 // =============================================================================
@@ -433,11 +443,240 @@ grpc::ServerUnaryReactor* SidecarServiceImpl::GetPeers(
 }
 
 // =============================================================================
+// ResumeSubscribe
+// =============================================================================
+
+class ResumeSubscribeReactor : public grpc::ServerWriteReactor<sidecar::MessageEvent> {
+public:
+    ResumeSubscribeReactor(SidecarServiceImpl* service,
+                           std::shared_ptr<core::PeerRegistry> registry,
+                           core::TopicMessageBuffer* messageBuffer,
+                           std::shared_ptr<SidecarServiceImpl::SubscriptionStream> stream,
+                           const sidecar::ResumeSubscribeRequest* request)
+        : service_(service)
+        , registry_(std::move(registry))
+        , messageBuffer_(messageBuffer)
+        , stream_(std::move(stream))
+        , gapRecoveryMode_(request->gap_recovery_mode())
+    {
+        stream_->reactor = this;
+
+        // Look up paused subscription
+        core::PausedSubscription pausedInfo;
+        bool resumed = registry_->resumeSubscription(
+            request->subscription_id(),
+            [](const core::RetainedMessage&) {},  // Placeholder callback
+            pausedInfo);
+
+        // Build subscription info
+        sidecar::MessageEvent infoEvent;
+        auto* info = infoEvent.mutable_subscription_info();
+        info->set_subscription_id(stream_->subscription_id);
+        for (const auto& topic : stream_->topics) {
+            info->add_topics(topic);
+        }
+        info->set_timestamp_ms(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
+        bool gapDetected = false;
+        uint64_t totalMissed = 0;
+
+        if (resumed && gapRecoveryMode_ != sidecar::GapRecoveryMode::NONE) {
+            // Perform gap recovery
+            for (const auto& topic : stream_->topics) {
+                uint64_t lastSeq = request->last_sequence_number();
+                if (lastSeq == 0) {
+                    // Use saved sequence from paused subscription
+                    auto seqIt = pausedInfo.topic_sequences.find(topic);
+                    if (seqIt != pausedInfo.topic_sequences.end()) {
+                        lastSeq = seqIt->second;
+                    } else {
+                        lastSeq = pausedInfo.last_delivered_sequence;
+                    }
+                }
+
+                bool topicGap = false;
+                uint64_t topicMissed = 0;
+
+                if (gapRecoveryMode_ == sidecar::GapRecoveryMode::RETAINED_ONLY) {
+                    // Just send retained message
+                    auto retained = messageBuffer_->getRetainedMessage(topic);
+                    if (retained) {
+                        sidecar::MessageEvent retEvent;
+                        auto* msg = retEvent.mutable_retained_message();
+                        msg->set_message_id(std::to_string(retained->sequence_number));
+                        msg->set_topic(retained->topic);
+                        msg->set_payload(retained->payload);
+                        msg->set_timestamp_ms(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                retained->timestamp.time_since_epoch()).count());
+                        pendingReplay_.push(std::move(retEvent));
+                    }
+                } else if (gapRecoveryMode_ == sidecar::GapRecoveryMode::REPLAY_BUFFER) {
+                    // Replay buffered messages
+                    auto messages = messageBuffer_->getMessagesForReplay(
+                        topic, lastSeq, topicGap, topicMissed);
+
+                    for (const auto& buffered : messages) {
+                        sidecar::MessageEvent replayEvent;
+                        auto* replay = replayEvent.mutable_replay_message();
+                        replay->set_message_id(std::to_string(buffered.sequence_number));
+                        replay->set_topic(buffered.topic);
+                        replay->set_payload(buffered.payload);
+                        replay->set_sequence_number(buffered.sequence_number);
+                        replay->set_timestamp_ms(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                buffered.timestamp.time_since_epoch()).count());
+                        pendingReplay_.push(std::move(replayEvent));
+                    }
+                }
+
+                if (topicGap) {
+                    gapDetected = true;
+                    totalMissed += topicMissed;
+                }
+            }
+
+            info->set_gap_detected(gapDetected);
+            info->set_missed_message_count(totalMissed);
+            info->set_replay_started(!pendingReplay_.empty());
+        }
+
+        LOG_INFO("SidecarService", "ResumeSubscribe: id={}, gap={}, missed={}, replay={}",
+                 stream_->subscription_id, gapDetected, totalMissed, pendingReplay_.size());
+
+        // Send subscription info first
+        currentEvent_ = std::move(infoEvent);
+        StartWrite(&currentEvent_);
+    }
+
+    void OnWriteDone(bool ok) override {
+        if (!ok || !stream_->active.load()) {
+            Finish(grpc::Status::OK);
+            return;
+        }
+
+        // First drain replay queue
+        if (!pendingReplay_.empty()) {
+            currentEvent_ = std::move(pendingReplay_.front());
+            pendingReplay_.pop();
+            StartWrite(&currentEvent_);
+            return;
+        }
+
+        // Send replay complete if we were replaying
+        if (!replayCompleteSent_ && gapRecoveryMode_ == sidecar::GapRecoveryMode::REPLAY_BUFFER) {
+            replayCompleteSent_ = true;
+            sidecar::MessageEvent completeEvent;
+            auto* complete = completeEvent.mutable_replay_complete();
+            complete->set_subscription_id(stream_->subscription_id);
+            complete->set_timestamp_ms(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            currentEvent_ = std::move(completeEvent);
+            StartWrite(&currentEvent_);
+            return;
+        }
+
+        // Check for pending live messages
+        std::lock_guard<std::mutex> lock(stream_->writeMutex);
+        if (!stream_->pendingMessages.empty()) {
+            currentEvent_ = std::move(stream_->pendingMessages.front());
+            stream_->pendingMessages.pop();
+            StartWrite(&currentEvent_);
+        } else {
+            stream_->writing.store(false);
+        }
+    }
+
+    void OnCancel() override {
+        LOG_INFO("SidecarService", "ResumeSubscribe cancelled: id={}",
+                 stream_->subscription_id);
+        stream_->active.store(false);
+    }
+
+    void OnDone() override {
+        LOG_DEBUG("SidecarService", "ResumeSubscribe done: id={}",
+                  stream_->subscription_id);
+        delete this;
+    }
+
+    void enqueueMessage(sidecar::MessageEvent event) {
+        if (!stream_->active.load()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(stream_->writeMutex);
+        stream_->pendingMessages.push(std::move(event));
+        
+        if (!stream_->writing.exchange(true)) {
+            if (!stream_->pendingMessages.empty()) {
+                currentEvent_ = std::move(stream_->pendingMessages.front());
+                stream_->pendingMessages.pop();
+                StartWrite(&currentEvent_);
+            } else {
+                stream_->writing.store(false);
+            }
+        }
+    }
+
+private:
+    SidecarServiceImpl* service_;
+    std::shared_ptr<core::PeerRegistry> registry_;
+    core::TopicMessageBuffer* messageBuffer_;
+    std::shared_ptr<SidecarServiceImpl::SubscriptionStream> stream_;
+    sidecar::GapRecoveryMode gapRecoveryMode_;
+    sidecar::MessageEvent currentEvent_;
+    std::queue<sidecar::MessageEvent> pendingReplay_;
+    bool replayCompleteSent_ = false;
+};
+
+grpc::ServerWriteReactor<sidecar::MessageEvent>* SidecarServiceImpl::ResumeSubscribe(
+    grpc::CallbackServerContext* context,
+    const sidecar::ResumeSubscribeRequest* request) {
+    
+    // Get paused subscription info
+    auto paused = registry_->getPausedSubscription(request->subscription_id());
+    if (!paused) {
+        // Return error via immediate finish
+        class ErrorReactor : public grpc::ServerWriteReactor<sidecar::MessageEvent> {
+        public:
+            ErrorReactor() {
+                Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, 
+                                   "No paused subscription found"));
+            }
+            void OnDone() override { delete this; }
+        };
+        return new ErrorReactor();
+    }
+
+    auto stream = std::make_shared<SubscriptionStream>();
+    stream->subscription_id = request->subscription_id();
+    stream->topics = paused->topics;
+
+    // Track active stream
+    {
+        std::lock_guard<std::mutex> lock(streamsMutex_);
+        activeStreams_[stream->subscription_id] = stream;
+    }
+
+    return new ResumeSubscribeReactor(this, registry_, messageBuffer_.get(), 
+                                       stream, request);
+}
+
+// =============================================================================
 // deliverFromRemote
 // =============================================================================
 
 void SidecarServiceImpl::deliverFromRemote(const mesh::MessageEnvelope& envelope) {
     const std::string& topic = envelope.topic();
+    
+    // Buffer the message for gap recovery
+    uint64_t sequenceNumber = 0;
+    if (messageBuffer_) {
+        sequenceNumber = messageBuffer_->bufferMessage(topic, envelope.payload());
+    }
     
     // Build MessageEvent
     sidecar::MessageEvent event;
@@ -449,6 +688,7 @@ void SidecarServiceImpl::deliverFromRemote(const mesh::MessageEnvelope& envelope
     msg->set_timestamp_ms(envelope.timestamp_ms());
     msg->set_source_node_id(envelope.source_node_id());
     msg->set_correlation_id(envelope.correlation_id());
+    msg->set_sequence_number(sequenceNumber);
 
     // Find matching streams
     std::vector<std::shared_ptr<SubscriptionStream>> matchingStreams;
@@ -466,15 +706,17 @@ void SidecarServiceImpl::deliverFromRemote(const mesh::MessageEnvelope& envelope
         }
     }
 
-    // Deliver to each matching stream
+    // Deliver to each matching stream and update sequence tracking
     for (auto& stream : matchingStreams) {
         if (stream->reactor) {
             static_cast<SubscribeReactor*>(stream->reactor)->enqueueMessage(event);
+            // Update sequence in registry
+            registry_->updateSubscriptionSequence(stream->subscription_id, topic, sequenceNumber);
         }
     }
 
-    LOG_TRACE("SidecarService", "Delivered message {} to {} streams",
-              envelope.message_id(), matchingStreams.size());
+    LOG_TRACE("SidecarService", "Delivered message {} seq={} to {} streams",
+              envelope.message_id(), sequenceNumber, matchingStreams.size());
 }
 
 }  // namespace services

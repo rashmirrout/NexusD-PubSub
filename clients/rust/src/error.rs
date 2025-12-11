@@ -9,6 +9,10 @@ pub enum Error {
     #[error("Connection error: {0}")]
     Connection(String),
     
+    /// Connection failed after reconnection attempts
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+    
     /// Publish operation failed
     #[error("Publish error: {0}")]
     Publish(String),

@@ -16,6 +16,7 @@
 #include "nexusd/services/export.hpp"
 #include "nexusd/services/mesh_client.hpp"
 #include "nexusd/core/peer_registry.hpp"
+#include "nexusd/core/topic_message_buffer.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <atomic>
@@ -57,9 +58,15 @@ public:
      * @brief Create sidecar service implementation.
      * @param registry Shared peer registry.
      * @param meshClient Client for forwarding to remote nodes.
+     * @param messageBufferSize Messages to buffer per topic for gap recovery.
+     * @param maxBufferMemory Maximum total memory for message buffers.
+     * @param pausedSubscriptionTtl TTL for paused subscriptions in milliseconds.
      */
     SidecarServiceImpl(std::shared_ptr<core::PeerRegistry> registry,
-                       std::shared_ptr<MeshClient> meshClient);
+                       std::shared_ptr<MeshClient> meshClient,
+                       uint32_t messageBufferSize = 5,
+                       size_t maxBufferMemory = 52428800,
+                       int64_t pausedSubscriptionTtl = 300000);
 
     ~SidecarServiceImpl() override;
 
@@ -94,6 +101,14 @@ public:
         sidecar::UnsubscribeResponse* response) override;
 
     /**
+     * @brief Handle ResumeSubscribe RPC (server-streaming).
+     * Resumes a paused subscription with gap detection and replay.
+     */
+    grpc::ServerWriteReactor<sidecar::MessageEvent>* ResumeSubscribe(
+        grpc::CallbackServerContext* context,
+        const sidecar::ResumeSubscribeRequest* request) override;
+
+    /**
      * @brief Handle GetTopics RPC.
      * Returns information about active topics.
      */
@@ -124,6 +139,8 @@ public:
 private:
     std::shared_ptr<core::PeerRegistry> registry_;
     std::shared_ptr<MeshClient> meshClient_;
+    std::unique_ptr<core::TopicMessageBuffer> messageBuffer_;
+    int64_t pausedSubscriptionTtl_;
 
     // Active subscription streams
     struct SubscriptionStream;

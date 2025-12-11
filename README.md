@@ -55,6 +55,9 @@ NexusD aims to be the **fastest, most resilient, and operationally simplest** pu
 - **gRPC Data Plane**: Efficient async callback API for pub/sub operations
 - **Retained Messages**: Last-known-good values delivered to new subscribers
 - **Cross-Platform**: Windows (Winsock2) and Linux/macOS (POSIX sockets)
+- **Client Resilience**: Automatic reconnection with exponential backoff across all client libraries
+- **Gap Detection**: Sequence number tracking to detect and recover missed messages
+- **Subscription Recovery**: Pause/resume subscriptions with message replay from ring buffer
 
 ## Building
 

@@ -182,12 +182,30 @@ bool PeerRegistry::addLocalSubscription(
     return true;
 }
 
-bool PeerRegistry::removeLocalSubscription(const std::string& subscriptionId) {
+bool PeerRegistry::removeLocalSubscription(const std::string& subscriptionId,
+                                           bool pause,
+                                           int64_t ttl_ms) {
     std::unique_lock<std::shared_mutex> lock(subscriptionMutex_);
 
     auto it = localSubscriptions_.find(subscriptionId);
     if (it == localSubscriptions_.end()) {
         return false;
+    }
+
+    // If pausing, save the subscription state
+    if (pause) {
+        auto paused = std::make_shared<PausedSubscription>();
+        paused->subscription_id = subscriptionId;
+        paused->client_id = it->second->client_id;
+        paused->topics = it->second->topics;
+        paused->max_buffer_size = it->second->max_buffer_size;
+        paused->last_delivered_sequence = it->second->last_delivered_sequence;
+        paused->paused_at = std::chrono::steady_clock::now();
+        paused->expires_at = paused->paused_at + std::chrono::milliseconds(ttl_ms);
+        
+        pausedSubscriptions_[subscriptionId] = paused;
+        LOG_INFO("PeerRegistry", "Paused subscription {} with TTL {}ms", 
+                 subscriptionId, ttl_ms);
     }
 
     // Remove from topic mapping
@@ -206,6 +224,105 @@ bool PeerRegistry::removeLocalSubscription(const std::string& subscriptionId) {
 
     LOG_INFO("PeerRegistry", "Removed subscription {}", subscriptionId);
     return true;
+}
+
+bool PeerRegistry::pauseSubscription(const std::string& subscriptionId, int64_t ttl_ms) {
+    return removeLocalSubscription(subscriptionId, true, ttl_ms);
+}
+
+bool PeerRegistry::resumeSubscription(
+    const std::string& subscriptionId,
+    std::function<void(const RetainedMessage&)> callback,
+    PausedSubscription& out_paused_info) {
+    
+    std::unique_lock<std::shared_mutex> lock(subscriptionMutex_);
+    
+    auto pausedIt = pausedSubscriptions_.find(subscriptionId);
+    if (pausedIt == pausedSubscriptions_.end()) {
+        LOG_WARN("PeerRegistry", "No paused subscription found: {}", subscriptionId);
+        return false;
+    }
+    
+    auto now = std::chrono::steady_clock::now();
+    if (now > pausedIt->second->expires_at) {
+        LOG_WARN("PeerRegistry", "Paused subscription {} has expired", subscriptionId);
+        pausedSubscriptions_.erase(pausedIt);
+        return false;
+    }
+    
+    // Copy paused info for gap detection
+    out_paused_info = *pausedIt->second;
+    
+    // Recreate the active subscription
+    auto sub = std::make_shared<LocalSubscription>();
+    sub->subscription_id = subscriptionId;
+    sub->client_id = pausedIt->second->client_id;
+    sub->topics = pausedIt->second->topics;
+    sub->max_buffer_size = pausedIt->second->max_buffer_size;
+    sub->created_at = std::chrono::steady_clock::now();
+    sub->last_delivered_sequence = pausedIt->second->last_delivered_sequence;
+    sub->deliverCallback = std::move(callback);
+    
+    localSubscriptions_[subscriptionId] = sub;
+    
+    // Restore topic -> subscription mapping
+    for (const auto& topic : sub->topics) {
+        topicToSubscriptions_[topic].insert(subscriptionId);
+    }
+    
+    // Remove from paused
+    pausedSubscriptions_.erase(pausedIt);
+    
+    hashDirty_.store(true);
+    
+    LOG_INFO("PeerRegistry", "Resumed subscription {} after pause", subscriptionId);
+    return true;
+}
+
+std::shared_ptr<PausedSubscription> PeerRegistry::getPausedSubscription(
+    const std::string& subscriptionId) const {
+    
+    std::shared_lock<std::shared_mutex> lock(subscriptionMutex_);
+    
+    auto it = pausedSubscriptions_.find(subscriptionId);
+    if (it != pausedSubscriptions_.end()) {
+        return std::make_shared<PausedSubscription>(*it->second);
+    }
+    return nullptr;
+}
+
+size_t PeerRegistry::clearExpiredPausedSubscriptions() {
+    std::unique_lock<std::shared_mutex> lock(subscriptionMutex_);
+    
+    auto now = std::chrono::steady_clock::now();
+    size_t count = 0;
+    
+    for (auto it = pausedSubscriptions_.begin(); it != pausedSubscriptions_.end(); ) {
+        if (now > it->second->expires_at) {
+            LOG_DEBUG("PeerRegistry", "Expired paused subscription: {}", it->first);
+            it = pausedSubscriptions_.erase(it);
+            ++count;
+        } else {
+            ++it;
+        }
+    }
+    
+    if (count > 0) {
+        LOG_INFO("PeerRegistry", "Cleared {} expired paused subscriptions", count);
+    }
+    
+    return count;
+}
+
+void PeerRegistry::updateSubscriptionSequence(const std::string& subscriptionId,
+                                              const std::string& topic,
+                                              uint64_t sequence) {
+    std::unique_lock<std::shared_mutex> lock(subscriptionMutex_);
+    
+    auto it = localSubscriptions_.find(subscriptionId);
+    if (it != localSubscriptions_.end()) {
+        it->second->last_delivered_sequence = sequence;
+    }
 }
 
 std::vector<std::shared_ptr<LocalSubscription>>
