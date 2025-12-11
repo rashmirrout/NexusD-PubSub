@@ -18,7 +18,15 @@ else
 
 async Task RunPublishExample()
 {
-    using var client = new Client("localhost:5672");
+    // Configure client with reconnection options
+    var options = new ClientOptions
+    {
+        MaxRetries = 10,
+        InitialRetryDelayMs = 1000,
+        MaxRetryDelayMs = 30000,
+    };
+
+    using var client = new Client("localhost:5672", options);
     Console.WriteLine("Connected to NexusD\n");
 
     // Publish a simple message
@@ -55,10 +63,33 @@ async Task RunPublishExample()
 
 async Task RunSubscribeExample()
 {
-    using var client = new Client("localhost:5672");
+    // Configure client with reconnection options
+    var clientOptions = new ClientOptions
+    {
+        MaxRetries = 0,  // 0 = infinite retries
+        InitialRetryDelayMs = 1000,
+        MaxRetryDelayMs = 30000,
+    };
+
+    using var client = new Client("localhost:5672", clientOptions);
     Console.WriteLine("Connected to NexusD");
     Console.WriteLine("Subscribing to sensors/* topics...");
+    Console.WriteLine("Auto-reconnect enabled with gap recovery");
     Console.WriteLine("Press Ctrl+C to stop\n");
+
+    // Register connection state callback
+    client.OnConnectionStateChange += (state, error) =>
+    {
+        Console.WriteLine($"[Connection] State: {state}" + (error != null ? $" - {error.Message}" : ""));
+    };
+
+    // Register gap detection callback
+    client.OnGapDetected += (expected, actual, topic) =>
+    {
+        var gap = actual - expected;
+        Console.WriteLine($"[Gap] Detected {gap} missed messages on {topic}");
+        Console.WriteLine($"       Expected seq {expected}, got {actual}");
+    };
 
     var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) =>
@@ -71,13 +102,20 @@ async Task RunSubscribeExample()
     try
     {
         string[] topics = ["sensors/temperature", "sensors/humidity", "config/settings"];
-        var options = new SubscribeOptions { ReceiveRetained = true };
+        
+        // Subscribe with gap recovery enabled
+        var options = new SubscribeOptions
+        {
+            ReceiveRetained = true,
+            GapRecoveryMode = GapRecoveryMode.ReplayBuffer,
+        };
 
         await foreach (var message in client.SubscribeAsync(topics, options, cts.Token))
         {
             var retainedFlag = message.IsRetained ? " [RETAINED]" : "";
             Console.WriteLine($"Topic: {message.Topic}{retainedFlag}");
             Console.WriteLine($"  Payload: {message.PayloadAsString}");
+            Console.WriteLine($"  Sequence: {message.SequenceNumber}");
             Console.WriteLine($"  Message ID: {message.MessageId}");
             Console.WriteLine($"  Timestamp: {message.TimestampMs}");
             Console.WriteLine();
