@@ -17,11 +17,13 @@
 #include "nexusd/services/mesh_client.hpp"
 #include "nexusd/core/peer_registry.hpp"
 #include "nexusd/core/topic_message_buffer.hpp"
+#include "nexusd/core/subscriber_queue.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 // Include generated gRPC service base
@@ -39,6 +41,11 @@ namespace services {
  * - Subscribe: Opens a stream for receiving messages
  * - Unsubscribe: Closes a subscription
  * - GetTopics/GetPeers: Monitoring endpoints
+ *
+ * Backpressure handling:
+ * - Per-subscriber queues with configurable limits
+ * - Policies: DROP_OLDEST (default), DROP_NEWEST, BLOCK
+ * - TTL enforcement for message expiration
  *
  * Usage:
  * @code
@@ -61,12 +68,22 @@ public:
      * @param messageBufferSize Messages to buffer per topic for gap recovery.
      * @param maxBufferMemory Maximum total memory for message buffers.
      * @param pausedSubscriptionTtl TTL for paused subscriptions in milliseconds.
+     * @param subscriberQueueLimit Max messages per subscriber queue.
+     * @param backpressurePolicy Drop policy: "drop-oldest", "drop-newest", "block".
+     * @param blockTimeoutMs Timeout for block policy before fallback (ms).
+     * @param defaultMessageTtlMs Default TTL for messages (0=infinite).
+     * @param ttlReaperIntervalMs Interval for TTL reaper thread (ms).
      */
     SidecarServiceImpl(std::shared_ptr<core::PeerRegistry> registry,
                        std::shared_ptr<MeshClient> meshClient,
                        uint32_t messageBufferSize = 5,
                        size_t maxBufferMemory = 52428800,
-                       int64_t pausedSubscriptionTtl = 300000);
+                       int64_t pausedSubscriptionTtl = 300000,
+                       uint32_t subscriberQueueLimit = 10000,
+                       const std::string& backpressurePolicy = "drop-oldest",
+                       int64_t blockTimeoutMs = 5000,
+                       int64_t defaultMessageTtlMs = 0,
+                       int64_t ttlReaperIntervalMs = 1000);
 
     ~SidecarServiceImpl() override;
 
@@ -141,6 +158,18 @@ private:
     std::shared_ptr<MeshClient> meshClient_;
     std::unique_ptr<core::TopicMessageBuffer> messageBuffer_;
     int64_t pausedSubscriptionTtl_;
+
+    // Backpressure configuration
+    uint32_t subscriberQueueLimit_;
+    core::BackpressurePolicy backpressurePolicy_;
+    int64_t blockTimeoutMs_;
+    int64_t defaultMessageTtlMs_;
+    int64_t ttlReaperIntervalMs_;
+
+    // TTL reaper thread
+    std::atomic<bool> reaperRunning_{false};
+    std::thread reaperThread_;
+    void ttlReaperLoop();
 
     // Active subscription streams
     struct SubscriptionStream;

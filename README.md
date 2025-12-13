@@ -24,6 +24,8 @@ NexusD aims to be the **fastest, most resilient, and operationally simplest** pu
 
 ---
 
+![NexusD Architecture](docs/NexusD.png)
+
 ## Architecture Overview
 
 ```

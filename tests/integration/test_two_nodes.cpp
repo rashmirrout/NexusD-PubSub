@@ -9,6 +9,7 @@
 #include <nexusd/core/peer_registry.hpp>
 #include <nexusd/core/discovery_agent.hpp>
 #include <nexusd/services/mesh_service.hpp>
+#include <nexusd/services/mesh_client.hpp>
 #include <nexusd/services/sidecar_service.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -58,7 +59,8 @@ public:
         
         // Create services
         mesh_service_ = std::make_unique<services::MeshServiceImpl>(registry_);
-        sidecar_service_ = std::make_unique<services::SidecarServiceImpl>(node_id_, registry_);
+        mesh_client_ = std::make_shared<services::MeshClient>();
+        sidecar_service_ = std::make_unique<services::SidecarServiceImpl>(registry_, mesh_client_);
         
         // Start mesh server
         std::string mesh_addr = "127.0.0.1:" + std::to_string(mesh_port_);
@@ -113,6 +115,7 @@ private:
     std::shared_ptr<core::PeerRegistry> registry_;
     std::unique_ptr<core::DiscoveryAgent> discovery_agent_;
     std::unique_ptr<services::MeshServiceImpl> mesh_service_;
+    std::shared_ptr<services::MeshClient> mesh_client_;
     std::unique_ptr<services::SidecarServiceImpl> sidecar_service_;
     std::unique_ptr<grpc::Server> mesh_server_;
     std::unique_ptr<grpc::Server> app_server_;

@@ -25,6 +25,7 @@ set(CORE_HEADERS
     ${CMAKE_SOURCE_DIR}/include/nexusd/core/peer_registry.hpp
     ${CMAKE_SOURCE_DIR}/include/nexusd/core/discovery_agent.hpp
     ${CMAKE_SOURCE_DIR}/include/nexusd/core/topic_message_buffer.hpp
+    ${CMAKE_SOURCE_DIR}/include/nexusd/core/subscriber_queue.hpp
 )
 
 # ----------------------------------------------------------------------------

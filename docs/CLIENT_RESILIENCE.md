@@ -408,6 +408,108 @@ nexusd_client_messages_received_total
 nexusd_client_connection_state
 ```
 
+## Backpressure Handling
+
+NexusD implements per-subscriber queue backpressure to protect slow consumers from overwhelming the system while ensuring fast consumers are not penalized.
+
+### Per-Subscriber Queues
+
+Each subscriber gets an isolated message queue with configurable limits. This design ensures:
+- Slow consumers don't affect fast consumers
+- Publishers are not globally throttled
+- Predictable memory usage per subscriber
+
+### Backpressure Policies
+
+| Policy | Description | Use Case |
+|--------|-------------|----------|
+| `drop-oldest` | Remove oldest message when full | Real-time data (latest value matters) |
+| `drop-newest` | Reject new message when full | Ordered processing (history matters) |
+| `block` | Block publisher until space | Critical messages (with timeout fallback) |
+
+### Message TTL
+
+Messages can have a time-to-live (TTL) that causes automatic expiration:
+
+- **Message-level TTL**: Publisher specifies `ttl_ms` per message
+- **Queue-level TTL**: Daemon default applies to all messages (`--default-message-ttl`)
+- **Hybrid enforcement**: Lazy check at dequeue + background reaper thread
+
+### Configuration
+
+```bash
+nexusd --subscriber-queue-limit 10000 \
+       --backpressure-policy drop-oldest \
+       --block-timeout-ms 5000 \
+       --default-message-ttl 60000 \
+       --ttl-reaper-interval 1000
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--subscriber-queue-limit` | 10000 | Max messages per subscriber queue |
+| `--backpressure-policy` | drop-oldest | Policy: drop-oldest, drop-newest, block |
+| `--block-timeout-ms` | 5000 | Timeout for block policy before fallback |
+| `--default-message-ttl` | 0 (infinite) | Default TTL for messages in ms |
+| `--ttl-reaper-interval` | 1000 | Background TTL reaper interval in ms |
+
+### Publisher-Side TTL
+
+Publishers can set TTL per message:
+
+```python
+# Python
+client.publish("sensor/temp", b"25.5", ttl_ms=30000)  # 30 second TTL
+```
+
+```typescript
+// TypeScript
+client.publish("sensor/temp", Buffer.from("25.5"), { ttlMs: 30000 });
+```
+
+```cpp
+// C++
+client.publish("sensor/temp", "25.5", {.ttl_ms = 30000});
+```
+
+### Queue Statistics
+
+Daemon tracks per-subscriber metrics:
+- Queue depth (current messages)
+- Messages dropped (by reason: oldest, newest, TTL, disconnect)
+- Block duration (time spent waiting)
+- TTL expirations
+
+### Design Rationale
+
+**Q: Why per-subscriber queues instead of a global queue?**
+
+A global queue unfairly penalizes fast consumers when slow consumers fill the queue:
+- Publisher → Global Queue → Fast Consumer ✓
+- Publisher → Global Queue → Slow Consumer (fills queue, causes drops for ALL)
+
+Per-subscriber queues isolate the impact:
+- Publisher → Fast Consumer Queue → Fast Consumer ✓
+- Publisher → Slow Consumer Queue → Slow Consumer (drops only affect slow consumer)
+
+**Q: Why DROP_OLDEST as default?**
+
+Most pub/sub use cases (sensors, telemetry, monitoring) care about the **latest** value:
+- Temperature sensor: latest reading matters, historical readings are stale
+- Stock ticker: latest price matters, old prices are irrelevant
+- Health checks: latest status matters, old status is misleading
+
+For ordered processing (logs, audit trails), use `drop-newest` to preserve history.
+
+**Q: When to use BLOCK policy?**
+
+Block policy is for critical messages where data loss is unacceptable:
+- Financial transactions
+- Order processing
+- Audit logs
+
+Always configure `--block-timeout-ms` to prevent indefinite blocking. After timeout, fallback to configured drop policy.
+
 ## Best Practices
 
 1. **Always set gap recovery mode** for critical message flows

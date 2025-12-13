@@ -9,6 +9,7 @@
 #include "nexusd/services/sidecar_service.hpp"
 #include "nexusd/utils/logger.hpp"
 #include "nexusd/utils/uuid.hpp"
+#include "nexusd/core/subscriber_queue.hpp"
 
 #include "nexusd/proto/mesh.pb.h"
 
@@ -28,7 +29,7 @@ struct SidecarServiceImpl::SubscriptionStream {
     grpc::ServerWriteReactor<sidecar::MessageEvent>* reactor{nullptr};
     std::atomic<bool> active{true};
     std::mutex writeMutex;
-    std::queue<sidecar::MessageEvent> pendingMessages;
+    std::unique_ptr<core::SubscriberQueue<sidecar::MessageEvent>> messageQueue;  // Backpressure-enabled queue
     std::atomic<bool> writing{false};
 };
 
@@ -76,8 +77,10 @@ public:
                     msg->set_timestamp_ms(retained->timestamp_ms);
                     msg->set_source_node_id(retained->source_node_id);
                     
-                    std::lock_guard<std::mutex> lock(stream_->writeMutex);
-                    stream_->pendingMessages.push(std::move(retEvent));
+                    // Enqueue via backpressure queue
+                    if (stream_->messageQueue) {
+                        stream_->messageQueue->enqueue(std::move(retEvent), 0);
+                    }
                 }
             }
         }
@@ -93,15 +96,17 @@ public:
             return;
         }
 
-        // Check for pending messages
+        // Dequeue from backpressure queue
         std::lock_guard<std::mutex> lock(stream_->writeMutex);
-        if (!stream_->pendingMessages.empty()) {
-            currentEvent_ = std::move(stream_->pendingMessages.front());
-            stream_->pendingMessages.pop();
-            StartWrite(&currentEvent_);
-        } else {
-            stream_->writing.store(false);
+        if (stream_->messageQueue && !stream_->messageQueue->empty()) {
+            auto msg = stream_->messageQueue->dequeue();
+            if (msg) {
+                currentEvent_ = std::move(*msg);
+                StartWrite(&currentEvent_);
+                return;
+            }
         }
+        stream_->writing.store(false);
     }
 
     void OnCancel() override {
@@ -117,24 +122,50 @@ public:
         delete this;
     }
 
-    void enqueueMessage(sidecar::MessageEvent event) {
+    /**
+     * @brief Enqueue a message with backpressure handling.
+     * @param event The message event to enqueue.
+     * @param ttlMs Message TTL (0 = use queue default).
+     * @return EnqueueResult indicating success, dropped, or blocked.
+     */
+    core::EnqueueResult enqueueMessage(sidecar::MessageEvent event, int64_t ttlMs = 0) {
         if (!stream_->active.load()) {
-            return;
+            return core::EnqueueResult::DROPPED_DISCONNECTED;
         }
 
-        std::lock_guard<std::mutex> lock(stream_->writeMutex);
-        stream_->pendingMessages.push(std::move(event));
-        
+        core::EnqueueResult result = core::EnqueueResult::ENQUEUED;
+        {
+            std::lock_guard<std::mutex> lock(stream_->writeMutex);
+            if (stream_->messageQueue) {
+                result = stream_->messageQueue->enqueue(std::move(event), ttlMs);
+            }
+        }
+
         // Start writing if not already
-        if (!stream_->writing.exchange(true)) {
-            if (!stream_->pendingMessages.empty()) {
-                currentEvent_ = std::move(stream_->pendingMessages.front());
-                stream_->pendingMessages.pop();
-                StartWrite(&currentEvent_);
+        if (result == core::EnqueueResult::ENQUEUED && !stream_->writing.exchange(true)) {
+            std::lock_guard<std::mutex> lock(stream_->writeMutex);
+            if (stream_->messageQueue && !stream_->messageQueue->empty()) {
+                auto msg = stream_->messageQueue->dequeue();
+                if (msg) {
+                    currentEvent_ = std::move(*msg);
+                    StartWrite(&currentEvent_);
+                }
             } else {
                 stream_->writing.store(false);
             }
         }
+        return result;
+    }
+
+    /**
+     * @brief Get queue statistics for this subscriber.
+     */
+    core::QueueStats getQueueStats() const {
+        std::lock_guard<std::mutex> lock(stream_->writeMutex);
+        if (stream_->messageQueue) {
+            return stream_->messageQueue->getStats();
+        }
+        return {};
     }
 
 private:
@@ -145,6 +176,19 @@ private:
 };
 
 // =============================================================================
+// Helper to parse backpressure policy string
+// =============================================================================
+
+static core::BackpressurePolicy parsePolicyString(const std::string& policy) {
+    if (policy == "drop-newest") {
+        return core::BackpressurePolicy::DROP_NEWEST;
+    } else if (policy == "block") {
+        return core::BackpressurePolicy::BLOCK;
+    }
+    return core::BackpressurePolicy::DROP_OLDEST;  // default
+}
+
+// =============================================================================
 // SidecarServiceImpl
 // =============================================================================
 
@@ -153,18 +197,44 @@ SidecarServiceImpl::SidecarServiceImpl(
     std::shared_ptr<MeshClient> meshClient,
     uint32_t messageBufferSize,
     size_t maxBufferMemory,
-    int64_t pausedSubscriptionTtl)
+    int64_t pausedSubscriptionTtl,
+    uint32_t subscriberQueueLimit,
+    const std::string& backpressurePolicy,
+    int64_t blockTimeoutMs,
+    int64_t defaultMessageTtlMs,
+    int64_t ttlReaperIntervalMs)
     : registry_(std::move(registry))
     , meshClient_(std::move(meshClient))
     , messageBuffer_(std::make_unique<core::TopicMessageBuffer>(
           messageBufferSize, maxBufferMemory))
     , pausedSubscriptionTtl_(pausedSubscriptionTtl)
+    , subscriberQueueLimit_(subscriberQueueLimit)
+    , backpressurePolicy_(parsePolicyString(backpressurePolicy))
+    , blockTimeoutMs_(blockTimeoutMs)
+    , defaultMessageTtlMs_(defaultMessageTtlMs)
+    , ttlReaperIntervalMs_(ttlReaperIntervalMs)
 {
     LOG_INFO("SidecarService", "Created sidecar service (buffer_size={}, max_memory={}, ttl={}ms)",
              messageBufferSize, maxBufferMemory, pausedSubscriptionTtl);
+    LOG_INFO("SidecarService", "Backpressure config: queue_limit={}, policy={}, block_timeout={}ms, default_ttl={}ms",
+             subscriberQueueLimit, backpressurePolicy, blockTimeoutMs, defaultMessageTtlMs);
+
+    // Start TTL reaper thread if TTL is enabled
+    if (defaultMessageTtlMs > 0 && ttlReaperIntervalMs > 0) {
+        reaperRunning_.store(true);
+        reaperThread_ = std::thread(&SidecarServiceImpl::ttlReaperLoop, this);
+        LOG_INFO("SidecarService", "TTL reaper started (interval={}ms)", ttlReaperIntervalMs);
+    }
 }
 
 SidecarServiceImpl::~SidecarServiceImpl() {
+    // Stop TTL reaper thread
+    if (reaperRunning_.exchange(false)) {
+        if (reaperThread_.joinable()) {
+            reaperThread_.join();
+        }
+    }
+
     // Cancel all active streams
     std::lock_guard<std::mutex> lock(streamsMutex_);
     for (auto& [id, stream] : activeStreams_) {
@@ -188,7 +258,8 @@ public:
                    std::shared_ptr<core::PeerRegistry> registry,
                    std::shared_ptr<MeshClient> meshClient,
                    const sidecar::PublishRequest* request,
-                   sidecar::PublishResponse* response)
+                   sidecar::PublishResponse* response,
+                   int64_t defaultTtlMs)
         : service_(service)
         , registry_(std::move(registry))
         , meshClient_(std::move(meshClient))
@@ -196,8 +267,11 @@ public:
         // Generate message ID
         std::string messageId = utils::UUIDGenerator::generate();
         
-        LOG_DEBUG("SidecarService", "Publish: topic={}, msg_id={}, retain={}",
-                  request->topic(), messageId, request->retain());
+        // Determine effective TTL (publisher TTL takes precedence)
+        int64_t effectiveTtl = request->ttl_ms() > 0 ? request->ttl_ms() : defaultTtlMs;
+        
+        LOG_DEBUG("SidecarService", "Publish: topic={}, msg_id={}, retain={}, ttl={}ms",
+                  request->topic(), messageId, request->retain(), effectiveTtl);
 
         // Build envelope
         mesh::MessageEnvelope envelope;
@@ -276,7 +350,7 @@ grpc::ServerUnaryReactor* SidecarServiceImpl::Publish(
     const sidecar::PublishRequest* request,
     sidecar::PublishResponse* response) {
     
-    return new PublishReactor(this, registry_, meshClient_, request, response);
+    return new PublishReactor(this, registry_, meshClient_, request, response, defaultMessageTtlMs_);
 }
 
 // =============================================================================
@@ -290,6 +364,13 @@ grpc::ServerWriteReactor<sidecar::MessageEvent>* SidecarServiceImpl::Subscribe(
     auto stream = std::make_shared<SubscriptionStream>();
     stream->subscription_id = generateSubscriptionId();
     stream->topics.assign(request->topics().begin(), request->topics().end());
+
+    // Create backpressure-enabled queue for this subscriber
+    stream->messageQueue = std::make_unique<core::SubscriberQueue<sidecar::MessageEvent>>(
+        subscriberQueueLimit_,
+        backpressurePolicy_,
+        blockTimeoutMs_,
+        defaultMessageTtlMs_);
 
     // Register with peer registry
     registry_->addLocalSubscription(
@@ -579,15 +660,17 @@ public:
             return;
         }
 
-        // Check for pending live messages
+        // Check for pending live messages (from backpressure queue)
         std::lock_guard<std::mutex> lock(stream_->writeMutex);
-        if (!stream_->pendingMessages.empty()) {
-            currentEvent_ = std::move(stream_->pendingMessages.front());
-            stream_->pendingMessages.pop();
-            StartWrite(&currentEvent_);
-        } else {
-            stream_->writing.store(false);
+        if (stream_->messageQueue && !stream_->messageQueue->empty()) {
+            auto msg = stream_->messageQueue->dequeue();
+            if (msg) {
+                currentEvent_ = std::move(*msg);
+                StartWrite(&currentEvent_);
+                return;
+            }
         }
+        stream_->writing.store(false);
     }
 
     void OnCancel() override {
@@ -602,23 +685,33 @@ public:
         delete this;
     }
 
-    void enqueueMessage(sidecar::MessageEvent event) {
+    core::EnqueueResult enqueueMessage(sidecar::MessageEvent event, int64_t ttlMs = 0) {
         if (!stream_->active.load()) {
-            return;
+            return core::EnqueueResult::DROPPED_DISCONNECTED;
         }
 
-        std::lock_guard<std::mutex> lock(stream_->writeMutex);
-        stream_->pendingMessages.push(std::move(event));
-        
-        if (!stream_->writing.exchange(true)) {
-            if (!stream_->pendingMessages.empty()) {
-                currentEvent_ = std::move(stream_->pendingMessages.front());
-                stream_->pendingMessages.pop();
-                StartWrite(&currentEvent_);
+        core::EnqueueResult result = core::EnqueueResult::ENQUEUED;
+        {
+            std::lock_guard<std::mutex> lock(stream_->writeMutex);
+            if (stream_->messageQueue) {
+                result = stream_->messageQueue->enqueue(std::move(event), ttlMs);
+            }
+        }
+
+        // Start writing if not already
+        if (result == core::EnqueueResult::ENQUEUED && !stream_->writing.exchange(true)) {
+            std::lock_guard<std::mutex> lock(stream_->writeMutex);
+            if (stream_->messageQueue && !stream_->messageQueue->empty()) {
+                auto msg = stream_->messageQueue->dequeue();
+                if (msg) {
+                    currentEvent_ = std::move(*msg);
+                    StartWrite(&currentEvent_);
+                }
             } else {
                 stream_->writing.store(false);
             }
         }
+        return result;
     }
 
 private:
@@ -655,6 +748,13 @@ grpc::ServerWriteReactor<sidecar::MessageEvent>* SidecarServiceImpl::ResumeSubsc
     stream->subscription_id = request->subscription_id();
     stream->topics = paused->topics;
 
+    // Create backpressure-enabled queue for this subscriber
+    stream->messageQueue = std::make_unique<core::SubscriberQueue<sidecar::MessageEvent>>(
+        subscriberQueueLimit_,
+        backpressurePolicy_,
+        blockTimeoutMs_,
+        defaultMessageTtlMs_);
+
     // Track active stream
     {
         std::lock_guard<std::mutex> lock(streamsMutex_);
@@ -663,6 +763,32 @@ grpc::ServerWriteReactor<sidecar::MessageEvent>* SidecarServiceImpl::ResumeSubsc
 
     return new ResumeSubscribeReactor(this, registry_, messageBuffer_.get(), 
                                        stream, request);
+}
+
+// =============================================================================
+// TTL Reaper Loop
+// =============================================================================
+
+void SidecarServiceImpl::ttlReaperLoop() {
+    while (reaperRunning_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ttlReaperIntervalMs_));
+        
+        if (!reaperRunning_.load()) break;
+        
+        size_t totalReaped = 0;
+        {
+            std::lock_guard<std::mutex> lock(streamsMutex_);
+            for (auto& [id, stream] : activeStreams_) {
+                if (stream->messageQueue) {
+                    totalReaped += stream->messageQueue->reapExpired();
+                }
+            }
+        }
+        
+        if (totalReaped > 0) {
+            LOG_DEBUG("SidecarService", "TTL reaper expired {} messages", totalReaped);
+        }
+    }
 }
 
 // =============================================================================
@@ -690,6 +816,11 @@ void SidecarServiceImpl::deliverFromRemote(const mesh::MessageEnvelope& envelope
     msg->set_correlation_id(envelope.correlation_id());
     msg->set_sequence_number(sequenceNumber);
 
+    // Track delivery stats
+    size_t deliveredCount = 0;
+    size_t droppedCount = 0;
+    size_t blockedCount = 0;
+
     // Find matching streams
     std::vector<std::shared_ptr<SubscriptionStream>> matchingStreams;
     {
@@ -706,13 +837,43 @@ void SidecarServiceImpl::deliverFromRemote(const mesh::MessageEnvelope& envelope
         }
     }
 
-    // Deliver to each matching stream and update sequence tracking
+    // Use message TTL or default
+    int64_t effectiveTtl = envelope.ttl_ms() > 0 ? envelope.ttl_ms() : defaultMessageTtlMs_;
+
+    // Deliver to each matching stream with backpressure handling
     for (auto& stream : matchingStreams) {
         if (stream->reactor) {
-            static_cast<SubscribeReactor*>(stream->reactor)->enqueueMessage(event);
-            // Update sequence in registry
-            registry_->updateSubscriptionSequence(stream->subscription_id, topic, sequenceNumber);
+            // Clone event for each subscriber
+            sidecar::MessageEvent eventCopy = event;
+            auto result = static_cast<SubscribeReactor*>(stream->reactor)
+                             ->enqueueMessage(std::move(eventCopy), effectiveTtl);
+            
+            switch (result) {
+                case core::EnqueueResult::ENQUEUED:
+                    ++deliveredCount;
+                    // Update sequence in registry
+                    registry_->updateSubscriptionSequence(stream->subscription_id, topic, sequenceNumber);
+                    break;
+                case core::EnqueueResult::DROPPED_OLDEST:
+                case core::EnqueueResult::DROPPED_NEWEST:
+                case core::EnqueueResult::DROPPED_TTL:
+                case core::EnqueueResult::DROPPED_DISCONNECTED:
+                    ++droppedCount;
+                    LOG_WARN("SidecarService", "Message dropped for subscriber {}: reason={}",
+                             stream->subscription_id, static_cast<int>(result));
+                    break;
+                case core::EnqueueResult::BLOCKED:
+                    ++blockedCount;
+                    LOG_WARN("SidecarService", "Message blocked for subscriber {}, will retry",
+                             stream->subscription_id);
+                    break;
+            }
         }
+    }
+
+    if (droppedCount > 0 || blockedCount > 0) {
+        LOG_DEBUG("SidecarService", "Delivery stats for msg {}: delivered={}, dropped={}, blocked={}",
+                  envelope.message_id(), deliveredCount, droppedCount, blockedCount);
     }
 
     LOG_TRACE("SidecarService", "Delivered message {} seq={} to {} streams",

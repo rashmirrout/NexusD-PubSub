@@ -85,6 +85,12 @@ message PublishResponse {
 
     // Error message if success is false.
     string error_message = 4;
+
+    // Number of subscribers where message was dropped due to backpressure.
+    int32 subscribers_dropped = 5;
+
+    // Number of subscribers where publisher was blocked waiting for queue space.
+    int32 subscribers_blocked = 6;
 }
 
 // =============================================================================
@@ -164,7 +170,34 @@ message MessageEvent {
 
         // Signals that replay phase is complete for a topic.
         ReplayComplete replay_complete = 6;
+
+        // Warning that messages are being dropped due to backpressure.
+        // Sent periodically when queue is under pressure.
+        BackpressureWarning backpressure_warning = 7;
     }
+}
+
+// Warning sent to subscribers when messages are being dropped.
+message BackpressureWarning {
+    // Total messages dropped since last warning (or subscription start).
+    uint64 messages_dropped = 1;
+
+    // Current queue depth for this subscriber.
+    uint64 queue_depth = 2;
+
+    // Queue limit configured for this subscriber.
+    uint64 queue_limit = 3;
+
+    // Reason for backpressure.
+    // Values: "slow_consumer", "burst", "ttl_expired"
+    string reason = 4;
+
+    // Messages expired due to TTL since last warning.
+    uint64 messages_expired = 5;
+
+    // Oldest message age in queue (milliseconds).
+    // Useful for detecting slow consumption.
+    int64 oldest_message_age_ms = 6;
 }
 
 message SubscriptionInfo {

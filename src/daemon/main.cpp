@@ -14,6 +14,7 @@
 #include <nexusd/core/peer_registry.hpp>
 #include <nexusd/core/discovery_agent.hpp>
 #include <nexusd/services/mesh_service.hpp>
+#include <nexusd/services/mesh_client.hpp>
 #include <nexusd/services/sidecar_service.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -86,10 +87,21 @@ int main(int argc, char* argv[]) {
         // Create mesh service
         auto mesh_service = std::make_unique<services::MeshServiceImpl>(peer_registry);
 
-        // Create sidecar service
+        // Create mesh client for remote forwarding
+        auto mesh_client = std::make_shared<services::MeshClient>();
+
+        // Create sidecar service with backpressure configuration
         auto sidecar_service = std::make_unique<services::SidecarServiceImpl>(
-            instance_uuid,
-            peer_registry
+            peer_registry,
+            mesh_client,
+            config.message_buffer_size,
+            config.max_buffer_memory_bytes,
+            config.paused_subscription_ttl_ms,
+            static_cast<uint32_t>(config.subscriber_queue_limit),
+            config.backpressure_policy,
+            config.block_timeout_ms,
+            config.default_message_ttl_ms,
+            config.ttl_reaper_interval_ms
         );
 
         // Build and start mesh gRPC server
